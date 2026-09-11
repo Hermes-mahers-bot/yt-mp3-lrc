@@ -38,6 +38,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -148,30 +149,48 @@ def strip_lrc_timestamps(lrc_text):
     return "\n".join(lines)
 
 
-def has_embedded_lyrics(mp3_path):
-    """True if the file already carries an ID3 USLT (lyrics) frame."""
-    try:
-        return b"USLT" in mp3_path.read_bytes()
-    except OSError:
-        return False
+def has_embedded_lyrics(path):
+    """True if the file already carries lyrics in its tags.
+
+    Uses ffprobe rather than scanning for the USLT bytes, so it works for any container
+    ffmpeg writes lyrics into (mp3 USLT, flac/vorbis LYRICS, m4a (c)lyr).
+    """
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format_tags=lyrics",
+         "-of", "default=nw=1:nk=1", str(path)],
+        capture_output=True, text=True)
+    return bool(r.stdout.strip())
 
 
 # ---------------------------------------------------------------- LRCLIB
 
 
-def _get_json(url):
+def _get_json(url, attempts=4):
+    """GET + parse JSON from LRCLIB, retrying transient failures.
+
+    LRCLIB occasionally answers 503/429 under load, and a 200-track run should not lose a song
+    to one blip. 404 is LRCLIB's "no such record" answer, not an error.
+    """
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return json.loads(r.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None          # LRCLIB's "no exact match" answer
-        log(f"   ! LRCLIB HTTP {e.code}")
-        return None
-    except Exception as e:
-        log(f"   ! LRCLIB error: {e}")
-        return None
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            if e.code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            log(f"   ! LRCLIB HTTP {e.code}")
+            return None
+        except Exception as e:
+            if attempt < attempts - 1:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            log(f"   ! LRCLIB error: {e}")
+            return None
+    return None
 
 
 def duration_ok(candidate, duration, tol=DURATION_TOLERANCE):
@@ -234,11 +253,24 @@ def _pick_candidate(candidates, duration, tol, want_artist, want_track=None):
     return plain_backup
 
 
-def find_lyrics(artist, track, album, duration):
-    """Return {'synced': str|None, 'plain': str|None}, or None if LRCLIB has nothing.
+def _found(rec):
+    """Shape a LRCLIB record into what the rest of the code wants, including a readable
+    description of WHICH record matched - so a wrong match is visible instead of silent."""
+    dur = rec.get("duration")
+    return {
+        "synced": rec.get("syncedLyrics"),
+        "plain": rec.get("plainLyrics"),
+        "source": f"{rec.get('artistName')} - {rec.get('trackName')}"
+                  f" ({dur:.0f}s)" if dur else f"{rec.get('artistName')} - {rec.get('trackName')}",
+    }
+
+
+def find_lyrics(artist, track, album, duration, tolerance=DURATION_TOLERANCE):
+    """Return {'synced', 'plain', 'source'}, or None if LRCLIB has nothing.
 
     Three passes: exact lookup -> fuzzy search on track name -> free-text search.
     The duration window is what stops a live version / cover / remix matching the wrong track.
+    Pass a tighter `tolerance` when matching on the title alone, where nothing else scopes it.
     """
     if not track:
         return None
@@ -252,9 +284,9 @@ def find_lyrics(artist, track, album, duration):
             params["duration"] = int(duration)
         rec = _get_json(f"{LRCLIB}/get?{urllib.parse.urlencode(params)}")
         if (rec and artist_matches(artist, rec.get("artistName"))
-                and duration_ok(rec, duration)
+                and duration_ok(rec, duration, tolerance)
                 and (rec.get("syncedLyrics") or rec.get("plainLyrics"))):
-            return {"synced": rec.get("syncedLyrics"), "plain": rec.get("plainLyrics")}
+            return _found(rec)
 
     # 2. fuzzy search on the track name alone, strict duration window.
     #    "&" and "and" are both common in titles, and "(feat. ...)" breaks matching.
@@ -268,16 +300,16 @@ def find_lyrics(artist, track, album, duration):
     for query in dict.fromkeys(v for v in variants if v):
         qs = urllib.parse.urlencode({"track_name": query})
         cand = _pick_candidate(_get_json(f"{LRCLIB}/search?{qs}"), duration,
-                              DURATION_TOLERANCE, artist)
+                              tolerance, artist)
         if cand:
-            return {"synced": cand.get("syncedLyrics"), "plain": cand.get("plainLyrics")}
+            return _found(cand)
 
     # 3. last resort: free-text search, looser window
     if artist:
         qs = urllib.parse.urlencode({"q": f"{artist} {track}"})
         cand = _pick_candidate(_get_json(f"{LRCLIB}/search?{qs}"), duration, 5, artist, track)
         if cand:
-            return {"synced": cand.get("syncedLyrics"), "plain": cand.get("plainLyrics")}
+            return _found(cand)
 
     return None
 
@@ -374,23 +406,26 @@ def download_mp3(vurl, stem):
     raise RuntimeError(f"download finished but no .mp3 found for stem {stem!r}")
 
 
-def embed_lyrics(mp3_path, lyrics_text):
-    """Write lyrics into the MP3's ID3 USLT frame.
+def embed_lyrics(audio_path, lyrics_text):
+    """Write lyrics into the file's lyrics tag.
 
     The audio stream is copied (-c copy), never re-encoded, so the sound is bit-identical.
-    ffmpeg cannot edit in place: write a temp file, then swap it in.
+    ffmpeg cannot edit in place: write a temp file, verify it, then swap it in.
     """
-    tmp = mp3_path.with_name(mp3_path.name + ".embedding.mp3")
-    cmd = [
-        "ffmpeg", "-y", "-v", "error",
-        "-i", str(mp3_path),
-        "-c", "copy",
-        "-id3v2_version", "3",          # ID3v2.3: the widest player support for USLT
-        "-metadata", f"lyrics={lyrics_text}",
-        str(tmp),
-    ]
-    subprocess.run(cmd, check=True)
-    os.replace(tmp, mp3_path)
+    tmp = audio_path.with_name(audio_path.name + ".embedding.tmp" + audio_path.suffix)
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(audio_path), "-c", "copy"]
+    if audio_path.suffix.lower() == ".mp3":
+        cmd += ["-id3v2_version", "3"]          # ID3v2.3: the widest player support for USLT
+    cmd += ["-metadata", f"lyrics={lyrics_text}", str(tmp)]
+    try:
+        subprocess.run(cmd, check=True)
+        # Never destroy the original if ffmpeg produced something unusable.
+        if not has_embedded_lyrics(tmp):
+            raise RuntimeError("ffmpeg ran but the lyrics tag isn't readable in the result")
+        os.replace(tmp, audio_path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 # ---------------------------------------------------------------- per-video flow
@@ -426,6 +461,7 @@ def process(vurl, force, embed, sidecar):
         return
 
     synced, plain = found["synced"], found["plain"]
+    log(f"   match: {found.get('source', '?')}")
     if need_sidecar and synced:
         # .lrc must sit next to the audio with the same basename for players to auto-load.
         lrc.write_text(synced, encoding="utf-8")

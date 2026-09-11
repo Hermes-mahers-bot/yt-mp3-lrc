@@ -1,21 +1,91 @@
 # yt-mp3-lrc
 
-Download audio from YouTube as **MP3**, with the **lyrics inside the MP3 file** and the synced timing alongside it.
+Two tools for getting synced lyrics into local music files. Both write the lyrics **into the file's
+own tag** and drop a **`.lrc` sidecar** beside it for timed display.
+
+| | What it does | Needs YouTube to work? |
+|---|---|---|
+| **`addlyrics.py`** | attach lyrics to MP3s you **already have** | **No** — you supply the audio, it only talks to LRCLIB |
+| **`yt2mp3lrc.py`** | download from YouTube *and* attach lyrics | Yes (see the troubleshooting section) |
 
 ```
-URL  ->  Music/Alan Walker - Faded.mp3     lyrics embedded in the file's ID3 tag
-URL  ->  Music/Alan Walker - Faded.lrc     [mm:ss.xx] timing, for players that want it
+song.mp3  ->  lyrics inside song.mp3  +  song.lrc
 ```
 
 No cover art. No config file. No database.
 
-**Three things must be installed:** `yt-dlp`, `ffmpeg`, and a **JavaScript runtime** (see below).
+**Recommended path: `addlyrics.py`.** Grab the audio with whatever tool you like, then point this at
+it. It never touches YouTube, so none of the bot-check / 403 / JS-runtime problems below apply.
 
 ---
 
-## ⚠️ Read this first: the two things that break YouTube downloads
+## addlyrics.py — attach lyrics to MP3s you already have
 
-### 1. A JavaScript runtime is now REQUIRED (same status as ffmpeg)
+```bash
+python3 addlyrics.py song.mp3 --link "https://youtu.be/XXXXXXXXXXX"
+python3 addlyrics.py song.mp3                       # works from the file's own tags
+python3 addlyrics.py song.mp3 --artist "X" --title "Y"
+python3 addlyrics.py *.mp3                          # batch
+python3 addlyrics.py /path/to/folder                # whole folder
+python3 addlyrics.py song.mp3 --dry-run             # show the match, change nothing
+python3 addlyrics.py song.mp3 --no-sidecar          # embed only: one file, no .lrc
+python3 addlyrics.py song.mp3 --force               # redo something already done
+```
+
+**Requires ffmpeg only.** `yt-dlp` is used *solely* if you pass `--link`, and it is never fatal if
+it's missing or fails — the file's own tags are used instead.
+
+### Where it gets the artist/title, in order
+
+1. `--artist` / `--title` / `--album` if you passed them
+2. the `--link`'s metadata (needs yt-dlp)
+3. the file's own tags — unless the artist tag looks like a channel name (`ANN MUSIC`, `7CLOUDS`,
+   `X - Topic`), which is dropped rather than trusted
+4. the filename, if it's genuinely `Artist - Title.mp3`
+5. **title-only — only if nothing above gave an artist**, and only with a tighter duration window
+
+### The safety rule that matters
+
+Matching needs an **artist** wherever one exists, because same-title-same-duration collisions are
+real. LRCLIB genuinely contains, for example:
+
+| Your track | Colliding record | Same title? | Same duration? |
+|---|---|---|---|
+| TheFatRat – Xenogenesis | 3TEETH – Xenogenesis | yes | 233s vs 235s |
+| Jim Yosef – Firefly | Mura Masa feat. NAO – Firefly | yes | 227s vs 224s |
+
+Without the artist, both pass every other check. So a guess that has an artist is always tried
+first, and title-only is a last resort that is **loudly flagged in the output**. Wrong lyrics are
+worse than no lyrics — a miss tells you why and how to fix it (pass `--artist`/`--title`).
+
+### Reading the output
+
+```
+-> Let Me Down Slowly.mp3
+   169s | tags: ANN MUSIC / Let Me Down Slowly
+   match: Alec Benjamin - Let Me Down Slowly (169s)
+   ! MATCHED ON THE TITLE ALONE - verify this is really the right song
+   + Let Me Down Slowly.lrc  (synced, 50 lines)
+   + lyrics embedded into Let Me Down Slowly.mp3  (49 lines)
+```
+
+`match:` always names the exact LRCLIB record used, so a wrong match is visible instead of silent.
+**Run `--dry-run` over a batch first** — it prints what would be matched and writes nothing.
+
+The audio is copied with `-c copy`, so **the sound is bit-identical** — verified by comparing the MD5
+of the decoded PCM before and after. The result is checked for a readable lyrics tag *before* the
+original file is replaced. If ffmpeg fails, your file is untouched.
+
+---
+
+## yt2mp3lrc.py — download from YouTube *and* attach lyrics
+
+Only use this if you want the download handled too. Everything in this section is about YouTube
+fighting automated downloads; none of it applies to `addlyrics.py`.
+
+### The two things that break YouTube downloads
+
+#### 1. A JavaScript runtime is now REQUIRED (same status as ffmpeg)
 
 yt-dlp can no longer talk to YouTube without an external JavaScript runtime. Without one, the
 download fails with:
@@ -42,7 +112,7 @@ python3 yt2mp3lrc.py --js-runtime node "URL"
 The tool checks for a runtime at startup and tells you what it found (or that nothing is there), so
 you'll see this before any download is attempted.
 
-### 2. YouTube also blocks connections ("Sign in to confirm you're not a bot")
+#### 2. YouTube also blocks connections ("Sign in to confirm you're not a bot")
 
 That one is about your **IP**, not your command. It hits mobile/carrier IPs behind CGNAT (you share
 one public IP with thousands of people) and datacenter/VPS IPs. Fix it with cookies from a browser
@@ -181,37 +251,55 @@ A miss is not a failure: the MP3 is still downloaded, it just has no lyrics. Not
 
 | File | Purpose |
 |---|---|
-| `yt2mp3lrc.py` | the whole tool |
-| `test_match.py` | artist/title guards (offline) + title→lyrics matching against the live LRCLIB API |
-| `requirements.txt` | `yt-dlp` |
+| `addlyrics.py` | attach lyrics to MP3s you already have (the recommended tool) |
+| `yt2mp3lrc.py` | download from YouTube + attach lyrics; also holds the shared LRCLIB matching code |
+| `test_addlyrics.py` | end-to-end tests for addlyrics.py (real LRCLIB, real ffmpeg) |
+| `test_match.py` | artist/title guards (offline) + live LRCLIB matching |
+| `requirements.txt` | `yt-dlp` (only needed for `yt2mp3lrc.py`, or `addlyrics.py --link`) |
 
 ## Verification status
 
-`python3 test_match.py` → **ALL TESTS PASSED** (2026-09, Linux, ffmpeg 6.1.1, yt-dlp 2026.08.19).
+`python3 test_match.py` → **ALL TESTS PASSED**
+`python3 test_addlyrics.py` → **ALL ADDLYRICS TESTS PASSED**
+(2026-09, Linux, ffmpeg 6.1.1, yt-dlp 2026.08.19)
 
-Verified:
+### addlyrics.py
 
-- **Lyrics are really in the MP3.** `USLT` frame present, words read back out of the file,
-  title/artist/album preserved, decoded-audio MD5 unchanged before/after embedding.
+Asserted in `test_addlyrics.py`:
+
+- Well-tagged file (Alan Walker / Faded, 212s) matched the right record; **decoded-audio MD5
+  unchanged** by embedding; lyrics tag readable back out; title/artist/album preserved; `.lrc`
+  written with matching basename.
+- Junk channel-style artist tag (`ANN MUSIC`) → tag dropped, **correct** match (Alec Benjamin),
+  and the title-only result **flagged** in the output.
+- No tags at all → matched correctly from the filename.
+- `--artist`/`--title` override junk tags.
+- **Instrumental must be a clean miss:** TheFatRat – Xenogenesis (233s) must NOT match
+  3TEETH – Xenogenesis (233s). Asserted.
+- `--dry-run` changed nothing (verified by hashing).
+- `--no-sidecar` leaves exactly one file.
+- `.ogg` refused; re-runs skip; `--link` with multiple files errors.
+
+### yt2mp3lrc.py
+
+- **Lyrics are really in the MP3** (`USLT` frame present, words read back out, tags preserved,
+  decoded-audio MD5 unchanged).
 - **Timestamps don't leak into the tag** (`[00:` never appears in the embedded text).
 - **Live LRCLIB matching on 9 real YouTube titles:** 6 vocal tracks matched with the right song's
   lyrics; 3 correctly returned nothing (2 instrumentals + 1 with no lyrics in LRCLIB).
 - **Two false positives found and fixed** via the artist guard, both regression-tested.
-- **Pipeline mechanics:** real yt-dlp download → ffmpeg MP3 → `.lrc` sidecar with matching basename,
-  correct timed lines, UTF-8; re-runs skip cleanly; instrumentals neither crash nor write an empty
-  `.lrc`; `--no-sidecar` leaves exactly one file.
-- **Failure messages:** bad URL, missing `yt-dlp`, missing `ffmpeg`, HTTP 403, wrong browser name
-  and missing cookie file all produce actionable text instead of a traceback (real URLs tested
-  against the live bot wall).
-- **`--cookies-from-browser` / `--cookies` / `--player-client` / `--js-runtime` are plumbed through
-  to yt-dlp** correctly (checked against `YTDL_EXTRA` and against yt-dlp's own `js_runtimes`
-  validation — a dict of `{runtime: {config}}`, default `{'deno': {}}`).
-- **JS runtime detection:** finds deno/node/bun/quickjs on PATH, stays quiet when deno is present
-  (yt-dlp auto-detects it), auto-enables the best available otherwise, and warns clearly when none
-  exists.
+- **Pipeline mechanics:** real download → ffmpeg MP3 → `.lrc` sidecar with matching basename;
+  re-runs skip cleanly; `--no-sidecar` leaves exactly one file.
+- **Failure messages:** bad URL, missing `yt-dlp`, missing `ffmpeg`, HTTP 403, wrong browser name and
+  missing cookie file all produce actionable text instead of a traceback.
+- **`--cookies-from-browser` / `--cookies` / `--player-client` / `--js-runtime` plumbed through**
+  correctly (checked against yt-dlp's own `js_runtimes` validation).
+- **JS runtime detection:** finds deno/node/bun/quickjs on PATH, quiet when deno is present,
+  auto-enables the best available otherwise, warns clearly when none exists.
+- **LRCLIB retries** transient 429/5xx with backoff (a live 503 was hit during testing and survived).
 
 **Not verified:** the YouTube *download* step itself. From this datacenter IP every attempt fails at
 the bot check ("Sign in to confirm you're not a bot") regardless of player client — deno/node as the
-JS runtime, `web_safari`, `tv`, `android_vr` and `ios` all still refused. So the working combination
-of cookies + JS runtime + client could not be confirmed here. Everything downstream of a successful
-download is tested.
+JS runtime, `web_safari`, `tv`, `android_vr` and `ios` all still refused. This is exactly why
+`addlyrics.py` exists: everything except the download is tested, and the download is the part YouTube
+is actively fighting.
