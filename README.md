@@ -9,6 +9,52 @@ URL  ->  Music/Alan Walker - Faded.lrc     [mm:ss.xx] timing, for players that w
 
 No cover art. No config file. No database. One dependency: `yt-dlp` (+ `ffmpeg` on PATH).
 
+---
+
+## ⚠️ "Sign in to confirm you're not a bot"
+
+If YouTube refuses with that message, it is blocking your **connection**, not your command. This
+happens a lot on:
+
+- **mobile / carrier IPs behind CGNAT** (you share one public IP with thousands of people)
+- datacenter / VPS IPs
+- any connection YouTube decides looks automated
+
+**Fix it with cookies from a browser you're already logged into:**
+
+```bash
+python3 yt2mp3lrc.py --cookies-from-browser firefox "URL"
+python3 yt2mp3lrc.py --cookies-from-browser chrome  "URL"
+```
+
+The browser must be **installed and logged into YouTube**. If you have several profiles:
+
+```bash
+python3 yt2mp3lrc.py --cookies-from-browser "firefox:default-release" "URL"
+```
+
+**If browser cookies don't work** (common with snap/flatpak Firefox, or a locked keyring), export
+cookies to a file instead — install a "Get cookies.txt LOCALLY" extension, log into YouTube, export
+for `youtube.com`, then:
+
+```bash
+python3 yt2mp3lrc.py --cookies ~/cookies.txt "URL"
+```
+
+**One more thing to try** if cookies are awkward — ask for a different player client:
+
+```bash
+python3 yt2mp3lrc.py --player-client web_safari "URL"     # also: mweb, tv, ios, android_vr
+```
+
+Which client works depends on your IP, so it is worth trying a couple. (Untested from here — see
+*Verification status*.)
+
+Installing **deno** also helps: newer yt-dlp needs a JavaScript runtime for full YouTube support and
+warns when it can't find one.
+
+---
+
 ## Why both the tag and the sidecar
 
 | | What it holds | Who reads it |
@@ -18,9 +64,8 @@ No cover art. No config file. No database. One dependency: `yt-dlp` (+ `ffmpeg` 
 
 The timing has to live in the sidecar, because ID3's own synchronized frame (`SYLT`) is so badly
 supported that even mp3tag cannot write it. So the MP3 carries the words, the sidecar carries the
-timing. Both are written by default; `--no-embed` or `--no-sidecar` turns either off.
-
-If you want **strictly one file per song**, use `--no-sidecar`: the lyrics still travel inside the MP3.
+timing. Both are written by default; `--no-embed` or `--no-sidecar` turns either off. Use
+`--no-sidecar` if you want **strictly one file per song**.
 
 ## Install
 
@@ -32,17 +77,28 @@ pip install yt-dlp        # ffmpeg must also be on PATH
 
 ```bash
 python3 yt2mp3lrc.py "https://youtu.be/XXXXXXXXXXX"          # one video
-python3 yt2mp3lrc.py "https://url1" "https://url2"           # several
+python3 yt2mp3lrc.py "URL1" "URL2"                           # several
 python3 yt2mp3lrc.py -f urls.txt                             # one URL per line
 python3 yt2mp3lrc.py "https://www.youtube.com/playlist?list=XXXX"   # whole playlist
 python3 yt2mp3lrc.py --force "URL"                           # redo even if already done
 python3 yt2mp3lrc.py -o /media/sdcard/Music "URL"            # custom output folder
 python3 yt2mp3lrc.py --no-sidecar "URL"                      # embed only: one file per song
 python3 yt2mp3lrc.py --no-embed "URL"                        # .lrc sidecar only
+python3 yt2mp3lrc.py --cookies-from-browser firefox "URL"    # when YouTube bot-checks you
 ```
 
-Re-running is safe and cheap: whatever is already done gets skipped, so you can point it at the same
+**Always quote your URLs.** Playlist links contain `&`, and an unquoted `&` makes the shell split
+the command and silently drop half the URL.
+
+**Where files go:** `Music/` **inside the current directory** — relative to where you run the
+command, not to where the script lives. It prints the resolved path at startup. `Music/` is
+gitignored, so nothing gets committed. Use `-o` to send them elsewhere.
+
+Re-running is safe and cheap: whatever is already done is skipped, so you can point it at the same
 folder every time you add music.
+
+Output symbols: `->` working on · `+` wrote a file · `=` already done · `-` no lyrics found (normal
+for instrumentals) · `!` failed.
 
 ## How the lyric matching works
 
@@ -55,18 +111,18 @@ Lyrics come from [LRCLIB](https://lrclib.net) (free, open, no account, no API ke
 
 Every candidate must pass **all** of these guards:
 
-- **Duration window** — ±3 s (±5 s on the last pass) against the video length. This is what stops
-  a live version or an extended edit matching the wrong recording.
+- **Duration window** — ±3 s (±5 s on the last pass) against the video length. Stops a live version
+  or extended edit matching the wrong recording.
 - **Artist guard** — the LRCLIB artist must share a significant word with the expected artist.
 - **Title guard** — on the free-text pass only, the candidate's title must share a word.
 
 The artist guard exists because of a real bug found during testing, not theory. LRCLIB contains
 unrelated songs that share a title *and* a near-identical duration:
 
-| Video | Wrong match it used to take | Result |
+| Video | Wrong match it used to take | Would have written |
 |---|---|---|
-| TheFatRat – Xenogenesis (235 s) | 3TEETH – Xenogenesis (233 s) | metal lyrics on an EDM instrumental |
-| Jim Yosef – Firefly (227 s) | Mura Masa feat. NAO – Firefly (224 s) | R&B lyrics on a drum & bass track |
+| TheFatRat – Xenogenesis (235 s) | 3TEETH – Xenogenesis (233 s) | death-metal lyrics on an EDM instrumental |
+| Jim Yosef – Firefly (227 s) | Mura Masa feat. NAO – Firefly (224 s) | unrelated R&B lyrics on a drum & bass track |
 
 Title junk is stripped before matching (`(Official Music Video)`, `[NCS Release]`, `[4K UPGRADE]`,
 `(Lyrics)`, `| Label | Genre` tails), and label channels (`NoCopyrightSounds`, `Monstercat`,
@@ -74,14 +130,12 @@ Title junk is stripped before matching (`(Official Music Video)`, `[NCS Release]
 
 ## What gets embedded
 
-The ID3 `USLT` frame is written with **readable text** — LRCLIB's plain lyrics, or the synced lyrics
-with the `[mm:ss.xx]` prefixes stripped out. Timestamps are deliberately *not* embedded: a player
-that only displays embedded lyrics as plain text would otherwise show you bracket noise. The timing
-stays in the `.lrc`.
+The ID3 `USLT` frame gets **readable text** — LRCLIB's plain lyrics, or the synced lyrics with the
+`[mm:ss.xx]` prefixes stripped. Timestamps are deliberately *not* embedded: a player that shows
+embedded lyrics as plain text would otherwise display bracket noise. The timing is the sidecar's job.
 
-The audio stream is written with `-c copy`, so **the sound is bit-identical** before and after
-embedding — verified by comparing the MD5 of the decoded PCM. Existing title/artist/album tags are
-preserved.
+Audio is written with `-c copy`, so **the sound is bit-identical** before and after embedding
+(verified by comparing the MD5 of the decoded PCM), and existing title/artist/album tags survive.
 
 ## Expected hit rate
 
@@ -99,20 +153,13 @@ A miss is not a failure: the MP3 is still downloaded, it just has no lyrics. Not
 - **MP3 quality** defaults to lame **V0** (`MP3_QUALITY = "0"`, ~245 kbps VBR). YouTube's source is
   ~160 kbps Opus, so CBR 320 adds no information — only size. Change the constant to `"320"` or
   `"192"` for CBR.
-- **Sidecar naming**: standard is `Song.lrc` beside `Song.mp3`, which is what Poweramp, Musicolet,
-  foobar2000, MusicBee, VLC, mpv and most DAPs expect. A few players look for `Song.mp3.lrc` — if
-  one doesn't pick it up, copy the file under that name too.
-- **No cover art**, per spec.
-- Lyrics are **offline** once downloaded. Budget DAPs don't fetch anything themselves, which is the
-  whole reason the `.lrc` sits in the folder.
-
-## Known limitations
-
-- **YouTube blocks datacenter IPs.** On a VPS this fails with *"Sign in to confirm you're not a
-  bot."* Run it from a home connection, or pass cookies to yt-dlp
-  (`--cookies-from-browser firefox` / `--cookies cookies.txt`). YouTube-side restriction, not a bug.
-- Newer yt-dlp versions want a JavaScript runtime (deno) for full YouTube extraction.
-- LRCLIB is crowd-sourced: coverage is good, not complete.
+- **Sidecar naming**: standard is `Song.lrc` beside `Song.mp3` — what Poweramp, Musicolet,
+  foobar2000, MusicBee, VLC, mpv and most DAPs expect. A few players look for `Song.mp3.lrc`; if one
+  doesn't pick it up, copy the file under that name too.
+- Single-video URLs skip the playlist probe, so a plain video costs one fewer request to YouTube —
+  fewer requests means fewer bot checks.
+- Lyrics are **offline** once downloaded. Budget DAPs fetch nothing themselves, which is why the
+  `.lrc` sits in the folder.
 
 ## Files
 
@@ -128,17 +175,20 @@ A miss is not a failure: the MP3 is still downloaded, it just has no lyrics. Not
 
 Verified:
 
-- **Lyrics really are in the MP3.** `USLT` frame present; the words read back out of the file;
-  title/artist/album tags preserved; decoded-audio MD5 unchanged before/after embedding.
+- **Lyrics are really in the MP3.** `USLT` frame present, words read back out of the file,
+  title/artist/album preserved, decoded-audio MD5 unchanged before/after embedding.
 - **Timestamps don't leak into the tag** (`[00:` never appears in the embedded text).
-- **Live LRCLIB matching, 9 real YouTube titles:** 6 vocal tracks correctly matched with the right
-  song's lyrics; 3 correctly returned *nothing* (2 instrumentals + one track LRCLIB has no lyrics
-  for).
-- **Two false positives found and fixed** via the artist guard, both now regression-tested.
-- **Pipeline mechanics:** yt-dlp download → ffmpeg MP3 → `.lrc` sidecar written with matching
-  basename, correct timed lines, UTF-8; re-runs skip cleanly; instrumentals neither crash nor write
-  an empty `.lrc`; `--no-sidecar` leaves exactly one file.
+- **Live LRCLIB matching on 9 real YouTube titles:** 6 vocal tracks matched with the right song's
+  lyrics; 3 correctly returned nothing (2 instrumentals + 1 with no lyrics in LRCLIB).
+- **Two false positives found and fixed** via the artist guard, both regression-tested.
+- **Pipeline mechanics:** real yt-dlp download → ffmpeg MP3 → `.lrc` sidecar with matching basename,
+  correct timed lines, UTF-8; re-runs skip cleanly; instrumentals neither crash nor write an empty
+  `.lrc`; `--no-sidecar` leaves exactly one file.
+- **Failure messages:** bad URL, missing `yt-dlp`, missing `ffmpeg`, wrong browser name and missing
+  cookie file all produce actionable text instead of a traceback (real URLs tested against the live
+  bot wall).
+- **`--cookies-from-browser` / `--cookies` are plumbed through to yt-dlp** correctly.
 
-**Not verified:** the YouTube extraction step itself — YouTube refuses datacenter IPs ("Sign in to
-confirm you're not a bot") regardless of player client (`web_safari`, `tv`, `android_vr`, `ios` all
-tested). That last hop needs a home connection.
+**Not verified:** the YouTube *download* step itself. Every player client tried from a datacenter IP
+(`web_safari`, `tv`, `android_vr`, `ios`) hits the bot wall, so the working combination of
+cookies/player-client could not be confirmed here. Everything downstream of the download is tested.

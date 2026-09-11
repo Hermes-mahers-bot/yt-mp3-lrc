@@ -48,7 +48,15 @@ OUT_DIR = Path("Music")          # where mp3 + lrc files go
 MP3_QUALITY = "0"                # lame V0 (~245 kbps VBR). "320" for CBR 320, "192" for CBR 192.
 DURATION_TOLERANCE = 3           # seconds. LRCLIB candidates must match the video length this closely.
 LRCLIB = "https://lrclib.net/api"
-USER_AGENT = "yt2mp3lrc/1.1 (https://github.com/Hermes-mahers-bot/yt-mp3-lrc)"
+USER_AGENT = "yt2mp3lrc/1.2 (https://github.com/Hermes-mahers-bot/yt-mp3-lrc)"
+
+# Extra yt-dlp options injected into every request (cookies, when the user passes them).
+# YouTube asks "Sign in to confirm you're not a bot" for a lot of connections, especially
+# mobile/carrier IPs behind CGNAT and datacenter IPs. Logged-in browser cookies fix it.
+YTDL_EXTRA = {}
+
+# Browsers yt-dlp can pull cookies out of.
+KNOWN_BROWSERS = {"brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale"}
 
 # YouTube channels/uploaders that are labels, not artists. If the "artist" is one of
 # these, we drop it and match on the track name alone.
@@ -296,11 +304,16 @@ class _Capture:
 
 def video_urls(url):
     """Expand a playlist/channel URL into individual video URLs."""
+    # A plain single-video URL needs no probe request - go straight at it. Fewer requests to
+    # YouTube means fewer chances of tripping its bot check.
+    if "list=" not in url and not re.search(r"/(playlist|channel|c/|user/|@)", url):
+        return [url]
+
     from yt_dlp import YoutubeDL
 
     cap = _Capture()
     opts = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist",
-            "skip_download": True, "ignoreerrors": True, "logger": cap}
+            "skip_download": True, "ignoreerrors": True, "logger": cap, **YTDL_EXTRA}
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
@@ -317,7 +330,7 @@ def video_urls(url):
 def fetch_metadata(vurl):
     from yt_dlp import YoutubeDL
 
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True, **YTDL_EXTRA}
     with YoutubeDL(opts) as ydl:
         return ydl.extract_info(vurl, download=False)
 
@@ -338,6 +351,7 @@ def download_mp3(vurl, stem):
         }],
         "overwrites": True,
         "noprogress": True,
+        **YTDL_EXTRA,
     }
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(vurl, download=True)
@@ -428,10 +442,21 @@ def explain(err):
         return ("yt-dlp isn't installed for the python you're running. Fix with: "
                 "python3 -m pip install yt-dlp   (use the same python you run this with)")
     if "not a bot" in low or "sign in" in low:
-        return ("YouTube is blocking this connection (bot check). Run it from a home "
-                "connection, or pass cookies: --cookies-from-browser firefox")
+        if YTDL_EXTRA:
+            return ("YouTube still refuses even with the cookies you passed. Usually the browser "
+                    "isn't logged in, you picked the wrong profile, or the cookie file is stale. "
+                    "Try BROWSER:PROFILE, or export a fresh cookies.txt and pass --cookies, or "
+                    "try --player-client web_safari")
+        return ("YouTube is blocking this connection (bot check). Carrier/mobile IPs and "
+                "datacenter IPs get this. Fix: python3 yt2mp3lrc.py "
+                "--cookies-from-browser firefox \"URL\"")
     if "ffmpeg" in low and ("not found" in low or "no such file" in low):
         return "ffmpeg isn't on PATH for this shell. Install it, then reopen the terminal."
+    if "could not find" in low and "cookies database" in low:
+        return ("no cookies database found for that browser. Is it installed and logged in? "
+                "Use BROWSER:PROFILE to pick a profile, or export a cookies.txt instead.")
+    if "unsupported browser" in low:
+        return "that browser isn't supported by yt-dlp. Try firefox, chrome, brave, edge, chromium."
     if "private video" in low or "video unavailable" in low or "removed" in low:
         return "that video is unavailable, private or deleted"
     if "unsupported url" in low:
@@ -449,7 +474,27 @@ def main():
     ap.add_argument("-o", "--out", help="output folder (default: Music, next to where you run this)")
     ap.add_argument("--no-embed", action="store_true", help="don't write lyrics into the MP3 tag")
     ap.add_argument("--no-sidecar", action="store_true", help="don't write the .lrc sidecar")
+    ap.add_argument("--cookies-from-browser", metavar="BROWSER",
+                    help="read cookies from a browser you're logged into (firefox, chrome, brave, "
+                         "edge, chromium, opera, vivaldi). Use BROWSER:PROFILE to pick a profile.")
+    ap.add_argument("--cookies", metavar="FILE",
+                    help="read cookies from a Netscape-format cookies.txt file instead")
+    ap.add_argument("--player-client", metavar="NAME",
+                    help="ask YouTube for a different player client (e.g. web_safari, mweb, tv). "
+                         "Worth trying when the bot check blocks you and cookies are awkward.")
     args = ap.parse_args()
+
+    if args.cookies_from_browser:
+        name = args.cookies_from_browser.split(":", 1)[0].lower()
+        if name not in KNOWN_BROWSERS:
+            ap.error(f"unknown browser {name!r}. Pick one of: {', '.join(sorted(KNOWN_BROWSERS))}")
+        YTDL_EXTRA["cookiesfrombrowser"] = tuple(args.cookies_from_browser.split(":", 1))
+    if args.cookies:
+        if not Path(args.cookies).is_file():
+            ap.error(f"cookie file not found: {args.cookies}")
+        YTDL_EXTRA["cookiefile"] = args.cookies
+    if args.player_client:
+        YTDL_EXTRA["extractor_args"] = {"youtube": {"player_client": [args.player_client]}}
 
     if args.out:
         OUT_DIR = Path(args.out)
