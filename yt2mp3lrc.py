@@ -270,18 +270,47 @@ def find_lyrics(artist, track, album, duration):
 # ---------------------------------------------------------------- download + embed
 
 
+class _Capture:
+    """Collects yt-dlp's error lines.
+
+    yt-dlp needs ignoreerrors=True so one dead video doesn't kill a whole playlist, but that
+    also swallows real failures (like YouTube's bot check) and leaves us with an empty result
+    and no explanation. This keeps the error text so it can be reported properly.
+    """
+
+    def __init__(self):
+        self.errors = []
+
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+    def warning(self, msg):
+        pass
+
+    def error(self, msg):
+        self.errors.append(msg)
+
+
 def video_urls(url):
     """Expand a playlist/channel URL into individual video URLs."""
     from yt_dlp import YoutubeDL
 
+    cap = _Capture()
     opts = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist",
-            "skip_download": True, "ignoreerrors": True}
+            "skip_download": True, "ignoreerrors": True, "logger": cap}
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
+
     if not info:
-        return []
+        raise RuntimeError(cap.errors[-1] if cap.errors else "could not read that URL")
     if info.get("_type") == "playlist":
-        return [e.get("url") or e.get("webpage_url") for e in (info.get("entries") or []) if e]
+        found = [e.get("url") or e.get("webpage_url") for e in (info.get("entries") or []) if e]
+        if not found:
+            raise RuntimeError(cap.errors[-1] if cap.errors else "playlist has nothing playable")
+        return found
     return [info.get("webpage_url") or url]
 
 
@@ -391,6 +420,25 @@ def process(vurl, force, embed, sidecar):
             log("   - nothing embeddable")
 
 
+def explain(err):
+    """Turn yt-dlp's common failures into something actionable."""
+    msg = str(err)
+    low = msg.lower()
+    if "no module named 'yt_dlp'" in low or "no module named yt_dlp" in low:
+        return ("yt-dlp isn't installed for the python you're running. Fix with: "
+                "python3 -m pip install yt-dlp   (use the same python you run this with)")
+    if "not a bot" in low or "sign in" in low:
+        return ("YouTube is blocking this connection (bot check). Run it from a home "
+                "connection, or pass cookies: --cookies-from-browser firefox")
+    if "ffmpeg" in low and ("not found" in low or "no such file" in low):
+        return "ffmpeg isn't on PATH for this shell. Install it, then reopen the terminal."
+    if "private video" in low or "video unavailable" in low or "removed" in low:
+        return "that video is unavailable, private or deleted"
+    if "unsupported url" in low:
+        return "that doesn't look like a URL yt-dlp supports"
+    return msg.splitlines()[0][:200] if msg else "unknown error"
+
+
 def main():
     global OUT_DIR
 
@@ -398,7 +446,7 @@ def main():
     ap.add_argument("urls", nargs="*", help="video or playlist URLs")
     ap.add_argument("-f", "--file", help="text file with one URL per line")
     ap.add_argument("--force", action="store_true", help="re-download and re-fetch lyrics")
-    ap.add_argument("-o", "--out", help="output folder (default: Music)")
+    ap.add_argument("-o", "--out", help="output folder (default: Music, next to where you run this)")
     ap.add_argument("--no-embed", action="store_true", help="don't write lyrics into the MP3 tag")
     ap.add_argument("--no-sidecar", action="store_true", help="don't write the .lrc sidecar")
     args = ap.parse_args()
@@ -415,14 +463,23 @@ def main():
         ap.print_help()
         sys.exit(1)
 
+    log(f"saving to {OUT_DIR.resolve()}/\n")
     total = 0
     for url in urls:
-        for vurl in video_urls(url):
+        try:
+            vurls = video_urls(url)
+        except Exception as e:
+            log(f"! {url}\n   ! {explain(e)}")
+            continue
+        if not vurls:
+            log(f"! {url}\n   ! nothing found there")
+            continue
+        for vurl in vurls:
             total += 1
             try:
                 process(vurl, args.force, not args.no_embed, not args.no_sidecar)
             except Exception as e:
-                log(f"   ! failed: {e}")
+                log(f"   ! failed: {explain(e)}")
     log(f"\ndone. {total} item(s) processed into {OUT_DIR}/")
 
 
