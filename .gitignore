@@ -1,0 +1,6 @@
+# downloaded music and fetched lyrics
+Music/
+
+# python
+__pycache__/
+*.pyc
