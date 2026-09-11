@@ -1,19 +1,31 @@
 #!/usr/bin/env python3
 """
-yt2mp3lrc - pull audio from YouTube as MP3, then fetch synced lyrics (.lrc sidecar).
+yt2mp3lrc - pull audio from YouTube as MP3, then get the lyrics INTO the MP3.
 
 What it does, per video:
-    URL  ->  Music/<Artist> - <Title>.mp3
-    URL  ->  Music/<Artist> - <Title>.lrc     (only when synced lyrics are found)
+    URL  ->  Music/<Artist> - <Title>.mp3     <- lyrics embedded in the ID3 tag (one file)
+    URL  ->  Music/<Artist> - <Title>.lrc     <- synced timing, for players that need it
 
-No cover art, no external database, no config file. Two dependencies: yt-dlp + ffmpeg.
+Why both:
+  * The lyrics are written into the MP3 itself (ID3 USLT frame), so the single file carries
+    its own lyrics. Players that show embedded lyrics (Musicolet, Poweramp, foobar2000, Kodi)
+    read it with no companion file.
+  * The timing (the [mm:ss.xx] timestamps) goes in the .lrc sidecar, because that is what
+    players actually use for karaoke-style *synced* display. ID3's synced frame (SYLT) exists
+    but almost nothing supports it - not even mp3tag can write it.
+  So: one file carries the words, the sidecar carries the timing. Both are written by default;
+  turn either off with --no-embed / --no-sidecar.
+
+No cover art. Two dependencies: yt-dlp + ffmpeg.
 
 Usage:
     python3 yt2mp3lrc.py "https://youtu.be/XXXXXXXXXXX"
     python3 yt2mp3lrc.py "https://url1" "https://url2"
-    python3 yt2mp3lrc.py -f urls.txt              # one URL per line
+    python3 yt2mp3lrc.py -f urls.txt                  # one URL per line
     python3 yt2mp3lrc.py "https://www.youtube.com/playlist?list=XXXX"
-    python3 yt2mp3lrc.py --force "URL"            # re-download even if files exist
+    python3 yt2mp3lrc.py --force "URL"                # redo even if already done
+    python3 yt2mp3lrc.py --no-sidecar "URL"           # embed only, strictly one file
+    python3 yt2mp3lrc.py --no-embed "URL"             # .lrc sidecar only
 
 Requires:
     pip install yt-dlp      (ffmpeg must be on PATH)
@@ -21,7 +33,9 @@ Requires:
 
 import argparse
 import json
+import os
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -34,7 +48,7 @@ OUT_DIR = Path("Music")          # where mp3 + lrc files go
 MP3_QUALITY = "0"                # lame V0 (~245 kbps VBR). "320" for CBR 320, "192" for CBR 192.
 DURATION_TOLERANCE = 3           # seconds. LRCLIB candidates must match the video length this closely.
 LRCLIB = "https://lrclib.net/api"
-USER_AGENT = "yt2mp3lrc/1.0 (https://github.com/Hermes-mahers-bot/yt-mp3-lrc)"
+USER_AGENT = "yt2mp3lrc/1.1 (https://github.com/Hermes-mahers-bot/yt-mp3-lrc)"
 
 # YouTube channels/uploaders that are labels, not artists. If the "artist" is one of
 # these, we drop it and match on the track name alone.
@@ -54,6 +68,9 @@ TITLE_JUNK = re.compile(
     r")\b[^\)\]]*?[\)\]]",
     re.IGNORECASE,
 )
+
+# Leading timestamps / tags on an LRC line: "[00:10.91] ", "[ar:Artist]", "[ti:Title]".
+LRC_PREFIX = re.compile(r"^\s*(\[\d{1,3}:\d{2}(\.\d{1,3})?\]|\[[a-z]{2,3}:[^\]]*\])+\s*", re.IGNORECASE)
 
 # ---------------------------------------------------------------- small helpers
 
@@ -106,6 +123,24 @@ def pick_output_stem(artist, track, fallback):
     return safe_filename(track or fallback)
 
 
+def strip_lrc_timestamps(lrc_text):
+    """LRC -> readable plain text, for embedding in the ID3 tag."""
+    lines = []
+    for line in lrc_text.splitlines():
+        text = LRC_PREFIX.sub("", line).rstrip()
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
+
+
+def has_embedded_lyrics(mp3_path):
+    """True if the file already carries an ID3 USLT (lyrics) frame."""
+    try:
+        return b"USLT" in mp3_path.read_bytes()
+    except OSError:
+        return False
+
+
 # ---------------------------------------------------------------- LRCLIB
 
 
@@ -131,8 +166,65 @@ def duration_ok(candidate, duration, tol=DURATION_TOLERANCE):
     return abs(float(cd) - float(duration)) <= tol
 
 
-def find_synced_lyrics(artist, track, album, duration):
-    """Return synced lyrics text, or None. Exact match first, then fuzzy search."""
+def _artist_tokens(name):
+    """Significant lowercase words in an artist name, ignoring feat./ft./& and punctuation."""
+    name = re.sub(r"\b(feat|ft|featuring|with|and|the)\b", " ", (name or ""), flags=re.IGNORECASE)
+    name = re.sub(r"[^\w\s]", " ", name.lower())
+    return {t for t in name.split() if len(t) > 2}
+
+
+def artist_matches(want, got):
+    """True if the wanted artist and the LRCLIB artist plausibly refer to the same act.
+
+    Guards against the nasty false positive: two unrelated songs with the same title and
+    almost the same duration. Examples caught in testing:
+      * "Xenogenesis" by 3TEETH (233s) vs a TheFatRat video (235s)
+      * "Firefly" by Mura Masa (224s) vs a "Jim Yosef - Firefly" video (227s)
+    Both would have written completely unrelated lyrics onto the file.
+    """
+    if not want or not got:
+        return True              # nothing to compare -> allow
+    return bool(_artist_tokens(want) & _artist_tokens(got))
+
+
+def title_matches(want, got):
+    """Loose title check, used only for the free-text fallback where nothing else scopes
+    the result to the right song. Ignores words of 3 letters or fewer, so short titles like
+    "On & On" fall through as "cannot judge" instead of being wrongly rejected."""
+    if not want or not got:
+        return True
+    a = {w for w in re.sub(r"[^\w\s]", " ", want.lower()).split() if len(w) > 3}
+    b = {w for w in re.sub(r"[^\w\s]", " ", got.lower()).split() if len(w) > 3}
+    if not a or not b:
+        return True
+    return bool(a & b)
+
+
+def _pick_candidate(candidates, duration, tol, want_artist, want_track=None):
+    """Best candidate: prefer one with synced lyrics, else any with plain lyrics."""
+    plain_backup = None
+    for cand in candidates or []:
+        if not (cand.get("syncedLyrics") or cand.get("plainLyrics")):
+            continue
+        if not artist_matches(want_artist, cand.get("artistName")):
+            continue
+        if want_track and not title_matches(want_track, cand.get("trackName")):
+            continue
+        if not duration_ok(cand, duration, tol):
+            continue
+        if cand.get("syncedLyrics"):
+            return cand
+        if plain_backup is None:
+            plain_backup = cand
+    return plain_backup
+
+
+def find_lyrics(artist, track, album, duration):
+    """Return {'synced': str|None, 'plain': str|None}, or None if LRCLIB has nothing.
+
+    Three passes: exact lookup -> fuzzy search on track name -> free-text search.
+    The duration window is what stops a live version / cover / remix matching the wrong track.
+    """
     if not track:
         return None
 
@@ -144,10 +236,13 @@ def find_synced_lyrics(artist, track, album, duration):
         if duration:
             params["duration"] = int(duration)
         rec = _get_json(f"{LRCLIB}/get?{urllib.parse.urlencode(params)}")
-        if rec and rec.get("syncedLyrics"):
-            return rec["syncedLyrics"]
+        if (rec and artist_matches(artist, rec.get("artistName"))
+                and duration_ok(rec, duration)
+                and (rec.get("syncedLyrics") or rec.get("plainLyrics"))):
+            return {"synced": rec.get("syncedLyrics"), "plain": rec.get("plainLyrics")}
 
-    # 2. fuzzy search on the track name alone, strict duration window
+    # 2. fuzzy search on the track name alone, strict duration window.
+    #    "&" and "and" are both common in titles, and "(feat. ...)" breaks matching.
     variants = [track]
     if "&" in track:
         variants.append(track.replace("&", "and"))
@@ -156,21 +251,23 @@ def find_synced_lyrics(artist, track, album, duration):
     variants.append(re.sub(r"\s*[\(\[].*?[\)\]]", "", track).strip())   # drop "(feat. ...)"
 
     for query in dict.fromkeys(v for v in variants if v):
-        for cand in _get_json(f"{LRCLIB}/search?{urllib.parse.urlencode({'track_name': query})}") or []:
-            if cand.get("syncedLyrics") and duration_ok(cand, duration):
-                return cand["syncedLyrics"]
+        qs = urllib.parse.urlencode({"track_name": query})
+        cand = _pick_candidate(_get_json(f"{LRCLIB}/search?{qs}"), duration,
+                              DURATION_TOLERANCE, artist)
+        if cand:
+            return {"synced": cand.get("syncedLyrics"), "plain": cand.get("plainLyrics")}
 
     # 3. last resort: free-text search, looser window
     if artist:
-        q = urllib.parse.urlencode({"q": f"{artist} {track}"})
-        for cand in _get_json(f"{LRCLIB}/search?{q}") or []:
-            if cand.get("syncedLyrics") and duration_ok(cand, duration, tol=5):
-                return cand["syncedLyrics"]
+        qs = urllib.parse.urlencode({"q": f"{artist} {track}"})
+        cand = _pick_candidate(_get_json(f"{LRCLIB}/search?{qs}"), duration, 5, artist, track)
+        if cand:
+            return {"synced": cand.get("syncedLyrics"), "plain": cand.get("plainLyrics")}
 
     return None
 
 
-# ---------------------------------------------------------------- download
+# ---------------------------------------------------------------- download + embed
 
 
 def video_urls(url):
@@ -221,17 +318,35 @@ def download_mp3(vurl, stem):
         p = Path(d.get("filepath", ""))
         if p.suffix.lower() == ".mp3" and p.exists():
             return p
-    hits = sorted(OUT_DIR.glob(f"{stem}.*"))
-    for p in hits:
+    for p in sorted(OUT_DIR.glob(f"{stem}.*")):
         if p.suffix.lower() == ".mp3":
             return p
     raise RuntimeError(f"download finished but no .mp3 found for stem {stem!r}")
 
 
+def embed_lyrics(mp3_path, lyrics_text):
+    """Write lyrics into the MP3's ID3 USLT frame.
+
+    The audio stream is copied (-c copy), never re-encoded, so the sound is bit-identical.
+    ffmpeg cannot edit in place: write a temp file, then swap it in.
+    """
+    tmp = mp3_path.with_name(mp3_path.name + ".embedding.mp3")
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-i", str(mp3_path),
+        "-c", "copy",
+        "-id3v2_version", "3",          # ID3v2.3: the widest player support for USLT
+        "-metadata", f"lyrics={lyrics_text}",
+        str(tmp),
+    ]
+    subprocess.run(cmd, check=True)
+    os.replace(tmp, mp3_path)
+
+
 # ---------------------------------------------------------------- per-video flow
 
 
-def process(vurl, force):
+def process(vurl, force, embed, sidecar):
     info = fetch_metadata(vurl)
     artist, track, album = split_artist_track(info)
     duration = info.get("duration")
@@ -242,37 +357,50 @@ def process(vurl, force):
     log(f"-> {info.get('title', vurl)}")
     log(f"   {artist or '?'} / {track or '?'}  ({duration or '?'}s)")
 
-    if mp3.exists() and lrc.exists() and not force:
-        log("   = already downloaded + lyrics present, skipping (use --force to redo)")
-        return
-
     if mp3.exists() and not force:
         log("   = mp3 already present")
     else:
         mp3 = download_mp3(vurl, stem)
         log(f"   + {mp3.name}")
 
-    if lrc.exists() and not force:
-        log("   = lyrics already present")
+    # What is still missing? (so an old file picky about one of them gets upgraded, not skipped)
+    need_sidecar = sidecar and (force or not lrc.exists())
+    need_embed = embed and (force or not has_embedded_lyrics(mp3))
+    if not (need_sidecar or need_embed):
+        log("   = lyrics already present, skipping (use --force to redo)")
         return
 
-    lyrics = find_synced_lyrics(artist, track, album, duration)
-    if lyrics:
+    found = find_lyrics(artist, track, album, duration)
+    if not found:
+        log("   - no lyrics found (instrumental, or not in LRCLIB)")
+        return
+
+    synced, plain = found["synced"], found["plain"]
+    if need_sidecar and synced:
         # .lrc must sit next to the audio with the same basename for players to auto-load.
-        lrc.write_text(lyrics, encoding="utf-8")
-        log(f"   + {lrc.name}  ({len(lyrics.splitlines())} timed lines)")
-    else:
-        log("   - no synced lyrics found (instrumental, or not in LRCLIB)")
+        lrc.write_text(synced, encoding="utf-8")
+        log(f"   + {lrc.name}  (synced, {len(synced.splitlines())} lines)")
+
+    if need_embed:
+        # Embed readable text: LRCLIB's plain lyrics, else the synced text with timestamps stripped.
+        text = plain or strip_lrc_timestamps(synced or "")
+        if text:
+            embed_lyrics(mp3, text)
+            log(f"   + lyrics embedded in {mp3.name}  ({len(text.splitlines())} lines)")
+        else:
+            log("   - nothing embeddable")
 
 
 def main():
     global OUT_DIR
 
-    ap = argparse.ArgumentParser(description="Download YouTube audio as MP3 + synced .lrc lyrics.")
+    ap = argparse.ArgumentParser(description="Download YouTube audio as MP3 and put the lyrics inside it.")
     ap.add_argument("urls", nargs="*", help="video or playlist URLs")
     ap.add_argument("-f", "--file", help="text file with one URL per line")
     ap.add_argument("--force", action="store_true", help="re-download and re-fetch lyrics")
     ap.add_argument("-o", "--out", help="output folder (default: Music)")
+    ap.add_argument("--no-embed", action="store_true", help="don't write lyrics into the MP3 tag")
+    ap.add_argument("--no-sidecar", action="store_true", help="don't write the .lrc sidecar")
     args = ap.parse_args()
 
     if args.out:
@@ -292,7 +420,7 @@ def main():
         for vurl in video_urls(url):
             total += 1
             try:
-                process(vurl, args.force)
+                process(vurl, args.force, not args.no_embed, not args.no_sidecar)
             except Exception as e:
                 log(f"   ! failed: {e}")
     log(f"\ndone. {total} item(s) processed into {OUT_DIR}/")
