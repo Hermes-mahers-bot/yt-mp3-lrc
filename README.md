@@ -7,51 +7,64 @@ URL  ->  Music/Alan Walker - Faded.mp3     lyrics embedded in the file's ID3 tag
 URL  ->  Music/Alan Walker - Faded.lrc     [mm:ss.xx] timing, for players that want it
 ```
 
-No cover art. No config file. No database. One dependency: `yt-dlp` (+ `ffmpeg` on PATH).
+No cover art. No config file. No database.
+
+**Three things must be installed:** `yt-dlp`, `ffmpeg`, and a **JavaScript runtime** (see below).
 
 ---
 
-## ⚠️ "Sign in to confirm you're not a bot"
+## ⚠️ Read this first: the two things that break YouTube downloads
 
-If YouTube refuses with that message, it is blocking your **connection**, not your command. This
-happens a lot on:
+### 1. A JavaScript runtime is now REQUIRED (same status as ffmpeg)
 
-- **mobile / carrier IPs behind CGNAT** (you share one public IP with thousands of people)
-- datacenter / VPS IPs
-- any connection YouTube decides looks automated
+yt-dlp can no longer talk to YouTube without an external JavaScript runtime. Without one, the
+download fails with:
 
-**Fix it with cookies from a browser you're already logged into:**
+```
+ERROR: unable to download video data: HTTP Error 403: Forbidden
+```
+
+**Deno is the only runtime yt-dlp detects by itself.** Install it:
+
+```bash
+curl -fsSL https://deno.land/install.sh | sh
+# then make sure it's on PATH (the installer tells you the line to add):
+export PATH="$HOME/.deno/bin:$PATH"
+deno --version
+```
+
+Already have **Node.js v20+**? You don't need deno — just ask for it explicitly:
+
+```bash
+python3 yt2mp3lrc.py --js-runtime node "URL"
+```
+
+The tool checks for a runtime at startup and tells you what it found (or that nothing is there), so
+you'll see this before any download is attempted.
+
+### 2. YouTube also blocks connections ("Sign in to confirm you're not a bot")
+
+That one is about your **IP**, not your command. It hits mobile/carrier IPs behind CGNAT (you share
+one public IP with thousands of people) and datacenter/VPS IPs. Fix it with cookies from a browser
+you're logged into:
 
 ```bash
 python3 yt2mp3lrc.py --cookies-from-browser firefox "URL"
 python3 yt2mp3lrc.py --cookies-from-browser chrome  "URL"
+python3 yt2mp3lrc.py --cookies-from-browser "firefox:default-release" "URL"   # pick a profile
 ```
 
-The browser must be **installed and logged into YouTube**. If you have several profiles:
+If browser cookies don't work (common with snap/flatpak Firefox, or a locked keyring), export
+`cookies.txt` with a "Get cookies.txt LOCALLY" extension and use `--cookies ~/cookies.txt`.
+
+**Also always keep yt-dlp current** — YouTube changes constantly and an outdated yt-dlp produces
+403s and extraction failures:
 
 ```bash
-python3 yt2mp3lrc.py --cookies-from-browser "firefox:default-release" "URL"
+python3 -m pip install -U yt-dlp
 ```
 
-**If browser cookies don't work** (common with snap/flatpak Firefox, or a locked keyring), export
-cookies to a file instead — install a "Get cookies.txt LOCALLY" extension, log into YouTube, export
-for `youtube.com`, then:
-
-```bash
-python3 yt2mp3lrc.py --cookies ~/cookies.txt "URL"
-```
-
-**One more thing to try** if cookies are awkward — ask for a different player client:
-
-```bash
-python3 yt2mp3lrc.py --player-client web_safari "URL"     # also: mweb, tv, ios, android_vr
-```
-
-Which client works depends on your IP, so it is worth trying a couple. (Untested from here — see
-*Verification status*.)
-
-Installing **deno** also helps: newer yt-dlp needs a JavaScript runtime for full YouTube support and
-warns when it can't find one.
+Last resort for weird IPs: `--player-client web_safari` (also `mweb`, `tv`, `ios`, `android_vr`).
 
 ---
 
@@ -70,7 +83,8 @@ timing. Both are written by default; `--no-embed` or `--no-sidecar` turns either
 ## Install
 
 ```bash
-pip install yt-dlp        # ffmpeg must also be on PATH
+python3 -m pip install -U yt-dlp     # keep this current; stale versions break
+# and: ffmpeg on PATH, plus deno (or --js-runtime node)
 ```
 
 ## Usage
@@ -84,7 +98,9 @@ python3 yt2mp3lrc.py --force "URL"                           # redo even if alre
 python3 yt2mp3lrc.py -o /media/sdcard/Music "URL"            # custom output folder
 python3 yt2mp3lrc.py --no-sidecar "URL"                      # embed only: one file per song
 python3 yt2mp3lrc.py --no-embed "URL"                        # .lrc sidecar only
+python3 yt2mp3lrc.py --js-runtime node "URL"                 # use node because deno isn't installed
 python3 yt2mp3lrc.py --cookies-from-browser firefox "URL"    # when YouTube bot-checks you
+python3 yt2mp3lrc.py --player-client tv "URL"                # last-resort client swap
 ```
 
 **Always quote your URLs.** Playlist links contain `&`, and an unquoted `&` makes the shell split
@@ -184,11 +200,18 @@ Verified:
 - **Pipeline mechanics:** real yt-dlp download → ffmpeg MP3 → `.lrc` sidecar with matching basename,
   correct timed lines, UTF-8; re-runs skip cleanly; instrumentals neither crash nor write an empty
   `.lrc`; `--no-sidecar` leaves exactly one file.
-- **Failure messages:** bad URL, missing `yt-dlp`, missing `ffmpeg`, wrong browser name and missing
-  cookie file all produce actionable text instead of a traceback (real URLs tested against the live
-  bot wall).
-- **`--cookies-from-browser` / `--cookies` are plumbed through to yt-dlp** correctly.
+- **Failure messages:** bad URL, missing `yt-dlp`, missing `ffmpeg`, HTTP 403, wrong browser name
+  and missing cookie file all produce actionable text instead of a traceback (real URLs tested
+  against the live bot wall).
+- **`--cookies-from-browser` / `--cookies` / `--player-client` / `--js-runtime` are plumbed through
+  to yt-dlp** correctly (checked against `YTDL_EXTRA` and against yt-dlp's own `js_runtimes`
+  validation — a dict of `{runtime: {config}}`, default `{'deno': {}}`).
+- **JS runtime detection:** finds deno/node/bun/quickjs on PATH, stays quiet when deno is present
+  (yt-dlp auto-detects it), auto-enables the best available otherwise, and warns clearly when none
+  exists.
 
-**Not verified:** the YouTube *download* step itself. Every player client tried from a datacenter IP
-(`web_safari`, `tv`, `android_vr`, `ios`) hits the bot wall, so the working combination of
-cookies/player-client could not be confirmed here. Everything downstream of the download is tested.
+**Not verified:** the YouTube *download* step itself. From this datacenter IP every attempt fails at
+the bot check ("Sign in to confirm you're not a bot") regardless of player client — deno/node as the
+JS runtime, `web_safari`, `tv`, `android_vr` and `ios` all still refused. So the working combination
+of cookies + JS runtime + client could not be confirmed here. Everything downstream of a successful
+download is tested.

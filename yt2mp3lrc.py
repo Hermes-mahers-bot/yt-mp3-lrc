@@ -35,6 +35,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.error
@@ -57,6 +58,12 @@ YTDL_EXTRA = {}
 
 # Browsers yt-dlp can pull cookies out of.
 KNOWN_BROWSERS = {"brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale"}
+
+# yt-dlp now REQUIRES an external JavaScript runtime for YouTube (same status as ffmpeg) -
+# without one, downloads fail with "HTTP Error 403: Forbidden". Deno is the only runtime
+# yt-dlp enables automatically; the rest have to be asked for explicitly. Ordered by preference.
+JS_RUNTIMES = ("deno", "node", "bun", "quickjs")
+DENO_INSTALL = "curl -fsSL https://deno.land/install.sh | sh"
 
 # YouTube channels/uploaders that are labels, not artists. If the "artist" is one of
 # these, we drop it and match on the track name alone.
@@ -434,15 +441,50 @@ def process(vurl, force, embed, sidecar):
             log("   - nothing embeddable")
 
 
+def find_js_runtimes():
+    """Return {name: path} for the JS runtimes present on PATH."""
+    return {name: p for name in JS_RUNTIMES if (p := shutil.which(name))}
+
+
+def setup_js_runtime(explicit):
+    """Make sure yt-dlp has a JavaScript runtime, or say why downloads will fail.
+
+    Deno is auto-detected by yt-dlp, so if it's installed there is nothing to do. If only
+    node/bun/quickjs is available we have to enable it explicitly. If nothing is available,
+    every download will fail with HTTP 403 - say that up front instead of letting the user
+    guess.
+    """
+    if explicit:
+        YTDL_EXTRA["js_runtimes"] = explicit
+        log(f"   js runtime: {', '.join(sorted(explicit))}")
+        return
+
+    found = find_js_runtimes()
+    if "deno" in found:
+        return                                    # yt-dlp picks deno up by itself
+
+    if found:
+        name = next(n for n in JS_RUNTIMES if n in found)     # best available
+        YTDL_EXTRA["js_runtimes"] = {name: {}}
+        log(f"! deno not found - using {name} ({found[name]}) as the JavaScript runtime.")
+        log(f"  (deno is the only one yt-dlp auto-detects; install it to drop this flag.)\n")
+        return
+
+    log("! No JavaScript runtime found (deno, node, bun or quickjs).")
+    log("  YouTube downloads now REQUIRE one - without it you get HTTP 403 Forbidden.")
+    log(f"  Install deno, then retry:   {DENO_INSTALL}")
+    log("  (or install Node.js and pass --js-runtime node)\n")
+
+
 def explain(err):
     """Turn yt-dlp's common failures into something actionable."""
     msg = str(err)
     low = msg.lower()
     if "no module named 'yt_dlp'" in low or "no module named yt_dlp" in low:
         return ("yt-dlp isn't installed for the python you're running. Fix with: "
-                "python3 -m pip install yt-dlp   (use the same python you run this with)")
+                "python3 -m pip install -U yt-dlp   (use the same python you run this with)")
     if "not a bot" in low or "sign in" in low:
-        if YTDL_EXTRA:
+        if YTDL_EXTRA.get("cookiesfrombrowser") or YTDL_EXTRA.get("cookiefile"):
             return ("YouTube still refuses even with the cookies you passed. Usually the browser "
                     "isn't logged in, you picked the wrong profile, or the cookie file is stale. "
                     "Try BROWSER:PROFILE, or export a fresh cookies.txt and pass --cookies, or "
@@ -450,6 +492,10 @@ def explain(err):
         return ("YouTube is blocking this connection (bot check). Carrier/mobile IPs and "
                 "datacenter IPs get this. Fix: python3 yt2mp3lrc.py "
                 "--cookies-from-browser firefox \"URL\"")
+    if "403" in low or "forbidden" in low:
+        return ("YouTube refused the download (403). In order of likelihood: (1) yt-dlp is "
+                "outdated - run: python3 -m pip install -U yt-dlp   (2) no JavaScript runtime - "
+                f"install deno: {DENO_INSTALL}   (3) try --player-client tv")
     if "ffmpeg" in low and ("not found" in low or "no such file" in low):
         return "ffmpeg isn't on PATH for this shell. Install it, then reopen the terminal."
     if "could not find" in low and "cookies database" in low:
@@ -482,6 +528,9 @@ def main():
     ap.add_argument("--player-client", metavar="NAME",
                     help="ask YouTube for a different player client (e.g. web_safari, mweb, tv). "
                          "Worth trying when the bot check blocks you and cookies are awkward.")
+    ap.add_argument("--js-runtime", metavar="NAME[:PATH]", action="append",
+                    help="enable a JavaScript runtime for YouTube (deno is auto-detected; use this "
+                         "for node, bun or quickjs, or a deno outside PATH). Repeatable.")
     args = ap.parse_args()
 
     if args.cookies_from_browser:
@@ -495,6 +544,15 @@ def main():
         YTDL_EXTRA["cookiefile"] = args.cookies
     if args.player_client:
         YTDL_EXTRA["extractor_args"] = {"youtube": {"player_client": [args.player_client]}}
+
+    explicit_js = {}
+    for spec in args.js_runtime or []:
+        name, _, path = spec.partition(":")
+        name = name.lower()
+        if name not in JS_RUNTIMES:
+            ap.error(f"unknown JS runtime {name!r}. Pick one of: {', '.join(JS_RUNTIMES)}")
+        explicit_js[name] = {"path": path} if path else {}
+    setup_js_runtime(explicit_js)
 
     if args.out:
         OUT_DIR = Path(args.out)
